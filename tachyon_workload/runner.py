@@ -64,10 +64,19 @@ class Runner:
              network_id=identity)
 
     async def snapshot(self):
+        unfinished = self.journal.unfinished()
         async def wallet_snapshot(wallet):
             synced = await self.cli.sync(wallet)
             balance = await self.cli.call(wallet, "balance-summary")
-            transactions = await self.cli.call(wallet, "transactions")
+            if synced.get("reorg"):
+                transactions = await self.cli.call(wallet, "transactions")
+            else:
+                ids = [operation["id"] for operation in unfinished if operation["wallet"] == wallet]
+                if ids:
+                    args = ["transaction-status"] + [arg for operation in ids for arg in ("--id", operation)]
+                    transactions = await self.cli.call(wallet, *args)
+                else:
+                    transactions = {"transactions": []}
             self.journal.reconcile(wallet, transactions["transactions"])
             self.wallet_tips[wallet] = (synced["height"], synced["hash"])
             emit("synced", wallet=wallet, height=synced["height"], tachyon_zat=balance["available_zat"],
@@ -82,22 +91,15 @@ class Runner:
         emit("faucet", **self.faucet.status())
         return caught_up
 
-    async def funding_utxos(self, busy):
-        # Only probe idle wallets. The wallet independently validates ownership,
-        # maturity, input reservations, and the mempool view again before signing.
+    async def funding_utxos(self, busy, balances):
+        # Devtool already validated ownership, maturity, reservations, and the
+        # canonical funding snapshot; selected inputs are checked again at signing.
         result = {}
         for wallet in self.wallets:
             if wallet in busy:
                 continue
-            response = await self.rpc.call("getaddressutxos", [{
-                "addresses": [self.addresses[wallet]["funding_address"]], "chainInfo": True}])
-            outputs = []
-            # Bounded work even after a long-running miner has accumulated rewards.
-            for utxo in sorted(response["utxos"], key=lambda u: (u["height"], u["txid"], u["outputIndex"]))[:64]:
-                live = await self.rpc.call("gettxout", [utxo["txid"], utxo["outputIndex"], True])
-                if live and live["confirmations"] >= (100 if live["coinbase"] else 1):
-                    outputs.append(utxo | {"coinbase": live["coinbase"]})
-            result[wallet] = outputs
+            transparent = balances[wallet].get("transparent") or {}
+            result[wallet] = list(transparent.get("funding_candidates") or [])
         return result
 
     async def lookup(self, operation):
@@ -235,7 +237,7 @@ class Runner:
         emit("round", round_id=round_id, mode=mode, height=height, target=target, bootstrap=bootstrap)
         if target:
             busy = {operation["wallet"] for operation in self.journal.unfinished()}
-            utxos = await self.funding_utxos(busy)
+            utxos = await self.funding_utxos(busy, balances)
             feed = await self.rpc.call("gettachyonblock", [str(height)])
             tachyon_allowed = (feed["poolHeight"] + 1) % feed["epochLength"] != 0
             payments = []

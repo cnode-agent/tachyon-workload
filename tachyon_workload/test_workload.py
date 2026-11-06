@@ -193,6 +193,33 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(runner.journal.get(operation["id"])["receipt_delivered"], 1)
         self.assertEqual(len(list(runner.receipts.glob("*.json"))), 1)
 
+    async def test_snapshot_skips_full_history_without_active_operations(self):
+        class StatusCli:
+            async def sync(self, wallet):
+                return {"height": 12, "hash": "tip", "reorg": False}
+
+            async def call(self, wallet, *args):
+                if args[0] == "balance-summary":
+                    return {"available_zat": 1, "transparent": None, "notes": []}
+                if args[0] == "transaction-status":
+                    return {"transactions": []}
+                raise AssertionError("full transaction history was requested")
+
+        runner = self.runner
+        runner.wallets = ["alice"]
+        runner.cli = StatusCli()
+        await runner.snapshot()
+
+    async def test_funding_discovery_uses_wallet_candidates_without_rpc(self):
+        runner = self.runner
+        runner.wallets = ["alice"]
+        runner.rpc = AsyncMock()
+        candidates = [{"txid": "tx", "outputIndex": 0, "satoshis": 100_000, "coinbase": False}]
+        balances = {"alice": {"transparent": {"funding_candidates": candidates}}}
+        result = await runner.funding_utxos(set(), balances)
+        self.assertEqual(result, {"alice": candidates})
+        runner.rpc.call.assert_not_called()
+
     async def test_zero_round_has_no_hidden_funding(self):
         runner = self.runner
         runner.config["max_transactions"] = 0
@@ -329,18 +356,6 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(operations), 2)
         self.assertEqual(len({op["wallet"] for op in operations}), 2)
         self.assertIn("treasury", {op["wallet"] for op in operations})
-
-    async def test_maturity_and_mempool_spends(self):
-        runner = self.runner
-        runner.wallets = ["treasury"]
-        runner.addresses = {"treasury": {"funding_address": "t:test"}}
-        response = {"utxos": [dict(txid=str(i), outputIndex=0, height=i, satoshis=625_000_000) for i in range(4)]}
-        runner.rpc = AsyncMock()
-        runner.rpc.call.side_effect = [response, dict(coinbase=True, confirmations=99),
-                                      dict(coinbase=True, confirmations=100), None,
-                                      dict(coinbase=False, confirmations=1)]
-        result = await runner.funding_utxos(set())
-        self.assertEqual([u["txid"] for u in result["treasury"]], ["1", "3"])
 
 
 if __name__ == "__main__":
