@@ -66,7 +66,7 @@ class Runner:
     async def snapshot(self):
         async def wallet_snapshot(wallet):
             synced = await self.cli.sync(wallet)
-            balance = await self.cli.call(wallet, "balance")
+            balance = await self.cli.call(wallet, "balance-summary")
             transactions = await self.cli.call(wallet, "transactions")
             self.journal.reconcile(wallet, transactions["transactions"])
             self.wallet_tips[wallet] = (synced["height"], synced["hash"])
