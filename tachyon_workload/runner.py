@@ -135,7 +135,8 @@ class Runner:
         if saved is None:
             try:
                 await self.cli.call(operation["wallet"], *json.loads(operation["args"]),
-                                    "--operation-id", operation["id"])
+                                    "--operation-id", operation["id"],
+                                    "--expected-tip", self.wallet_tips[operation["wallet"]][1])
             except (CliError, TimeoutError):
                 saved = await self.lookup(operation)
                 if saved is None:

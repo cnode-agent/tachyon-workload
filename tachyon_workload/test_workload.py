@@ -142,8 +142,10 @@ class FakeCli:
         self.creations = 0
         self.imports = 0
         self.fail_import = True
+        self.calls = []
 
     async def call(self, wallet, *args):
+        self.calls.append((wallet, args))
         if args[0] == "operation":
             if not self.saved:
                 raise CliError("unknown operation ID")
@@ -180,9 +182,12 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         runner.rpc.call.return_value = ["tx"]
         round_id = runner.journal.new_round("tip", 12, "live", 1)
         operation = runner.journal.plan(round_id, "alice", "bob", ["send", "--amount-zat", "123"])
+        runner.wallet_tips["alice"] = (12, "snapshot-hash")
         with self.assertRaisesRegex(CliError, "interrupted receipt"):
             await runner.execute(operation)
         await runner.execute(runner.journal.get(operation["id"]))
+        payment_call = next(args for wallet, args in runner.cli.calls if args[0] == "send")
+        self.assertEqual(payment_call[-2:], ("--expected-tip", "snapshot-hash"))
         self.assertEqual(runner.cli.creations, 1)
         self.assertEqual(runner.cli.imports, 2)
         self.assertEqual(runner.journal.get(operation["id"])["receipt_delivered"], 1)
