@@ -183,6 +183,26 @@ class DevtoolTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+    async def test_timing_flag_is_forwarded_and_logged(self):
+        config, _, _, _ = fixture()
+        config["timing"] = True
+
+        class FakeProcess:
+            def __init__(self):
+                self.returncode = 0
+                self.communicate = AsyncMock(
+                    return_value=(b"{}", b'TACHYON_TIMING {"total_us": 5}\n'))
+
+        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=FakeProcess())) as spawn, \
+                patch("tachyon_workload.runtime.emit") as emitted:
+            await Devtool(config).call("alice", "sync")
+        call = spawn.await_args
+        assert call is not None
+        self.assertEqual(call.kwargs["env"]["TACHYON_TIMING"], "1")
+        emitted.assert_called_once_with(
+            "timing", wallet="alice", command="sync", total_us=5)
+
+
 class RunnerTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()

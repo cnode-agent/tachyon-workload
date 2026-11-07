@@ -46,6 +46,7 @@ def load_config(path):
     defaults = dict(wallet_count=32, max_transactions=8, concurrency=4,
                     activation_height=8, poll_seconds=2, command_timeout=1800,
                     allow_external_transactions=False,
+                    timing=False,
                     min_amount_zat=100_000, max_amount_zat=2_000_000,
                     seed_amount_zat=10_000_000, seed_notes=3,
                     weights={"send": 80, "unshield": 8, "shield": 8,
@@ -56,6 +57,8 @@ def load_config(path):
     config = defaults | config
     if type(config["allow_external_transactions"]) is not bool:
         raise ValueError("allow_external_transactions must be true or false")
+    if type(config["timing"]) is not bool:
+        raise ValueError("timing must be true or false")
     for key in ("devtool", "wallet_root", "state_dir"):
         config[key] = (path.parent / config[key]).absolute()
     if config.get("cookie_file"):
@@ -130,11 +133,15 @@ class Devtool:
     async def call(self, wallet, *args):
         lock = self.locks.setdefault(wallet, asyncio.Lock())
         async with lock, self.slots:
+            env = {**os.environ,
+                   "TACHYON_EVIDENCE_DIR": str(self.config["wallet_root"] / ".evidence")}
+            if self.config["timing"]:
+                env["TACHYON_TIMING"] = "1"
             process = await asyncio.create_subprocess_exec(
                 str(self.config["devtool"]), "tachyon", "--wallet-dir",
                 str(self.config["wallet_root"] / wallet), *map(str, args),
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                env={**os.environ, "TACHYON_EVIDENCE_DIR": str(self.config["wallet_root"] / ".evidence")})
+                env=env)
             try:
                 stdout, stderr = await asyncio.wait_for(
                     process.communicate(), self.config["command_timeout"])
@@ -148,9 +155,22 @@ class Devtool:
                         process.kill()
                         await process.wait()
                 raise
+            self.log_timing(stderr.decode(errors="replace"), wallet, args)
             if process.returncode:
                 raise CliError(stderr.decode(errors="replace").strip()[-2000:])
             return json.loads(stdout)
+
+    @staticmethod
+    def log_timing(stderr, wallet, args):
+        for line in stderr.splitlines():
+            if not line.startswith("TACHYON_TIMING "):
+                continue
+            try:
+                timing = json.loads(line[len("TACHYON_TIMING "):])
+                emit("timing", wallet=wallet,
+                     command=str(args[0]) if args else None, **timing)
+            except (ValueError, TypeError):
+                continue
 
     async def sync(self, wallet):
         for _ in range(100):
