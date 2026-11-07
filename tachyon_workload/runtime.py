@@ -133,7 +133,8 @@ class Devtool:
             process = await asyncio.create_subprocess_exec(
                 str(self.config["devtool"]), "tachyon", "--wallet-dir",
                 str(self.config["wallet_root"] / wallet), *map(str, args),
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                env={**os.environ, "TACHYON_EVIDENCE_DIR": str(self.config["wallet_root"] / ".evidence")})
             try:
                 stdout, stderr = await asyncio.wait_for(
                     process.communicate(), self.config["command_timeout"])

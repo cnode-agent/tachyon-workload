@@ -5,11 +5,11 @@ from pathlib import Path
 import random
 import tempfile
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from .planner import FEE, choose_payment, funding_payment
 from .runner import Runner
-from .runtime import CliError, Journal, load_config, private_dir
+from .runtime import CliError, Devtool, Journal, load_config, private_dir
 
 
 def fixture():
@@ -162,6 +162,25 @@ class FakeCli:
                 self.fail_import = False
                 raise CliError("interrupted receipt import")
         return {}
+
+
+class DevtoolTests(unittest.IsolatedAsyncioTestCase):
+    async def test_wallets_share_public_evidence_directory(self):
+        config, _, _, _ = fixture()
+        class FakeProcess:
+            def __init__(self):
+                self.returncode = 0
+                self.communicate = AsyncMock(return_value=(b"{}", b""))
+
+        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=FakeProcess())) as spawn:
+            await Devtool(config).call("alice", "sync")
+        call = spawn.await_args
+        assert call is not None
+        env = call.kwargs["env"]
+        self.assertEqual(
+            env["TACHYON_EVIDENCE_DIR"],
+            str(Path(str(config["wallet_root"])) / ".evidence"),
+        )
 
 
 class RunnerTests(unittest.IsolatedAsyncioTestCase):
