@@ -51,7 +51,8 @@ def load_config(path):
                     seed_amount_zat=10_000_000, seed_notes=3,
                     weights={"send": 80, "unshield": 8, "shield": 8,
                              "transparent-send": 4})
-    allowed = {*defaults, "rpc_url", "devtool", "wallet_root", "state_dir", "cookie_file", "faucet"}
+    allowed = {*defaults, "rpc_url", "oss_url", "devtool", "wallet_root", "state_dir", "cookie_file",
+               "oss_cookie_file", "faucet"}
     if set(config) - allowed:
         raise ValueError(f"unknown config fields: {sorted(set(config) - allowed)}")
     config = defaults | config
@@ -61,11 +62,13 @@ def load_config(path):
         raise ValueError("timing must be true or false")
     for key in ("devtool", "wallet_root", "state_dir"):
         config[key] = (path.parent / config[key]).absolute()
-    if config.get("cookie_file"):
-        config["cookie_file"] = (path.parent / config["cookie_file"]).absolute()
-    url = urllib.parse.urlsplit(config["rpc_url"])
-    if url.scheme not in ("http", "https") or not url.hostname or url.username or url.password:
-        raise ValueError("RPC URL must be HTTP(S), without embedded credentials")
+    for key in ("cookie_file", "oss_cookie_file"):
+        if config.get(key):
+            config[key] = (path.parent / config[key]).absolute()
+    for key in ("rpc_url", "oss_url"):
+        url = urllib.parse.urlsplit(str(config.get(key, "")))
+        if url.scheme not in ("http", "https") or not url.hostname or url.username or url.password:
+            raise ValueError(f"{key} must be an HTTP(S) URL without embedded credentials")
     for name, minimum, maximum in (
         ("wallet_count", 2, 128), ("max_transactions", 0, 128),
         ("concurrency", 1, 16), ("activation_height", 1, 2**32 - 1),
@@ -143,8 +146,9 @@ class Devtool:
             return await self._run(wallet, ("prewarm-epochs",))
 
     async def _run(self, wallet, args):
-        env = {**os.environ,
-               "TACHYON_EVIDENCE_DIR": str(self.config["wallet_root"] / ".evidence")}
+        env = {**os.environ, "TACHYON_OSS_URL": self.config["oss_url"]}
+        if self.config.get("oss_cookie_file"):
+            env["TACHYON_OSS_COOKIE"] = str(self.config["oss_cookie_file"])
         if self.config["timing"]:
             env["TACHYON_TIMING"] = "1"
         process = await asyncio.create_subprocess_exec(

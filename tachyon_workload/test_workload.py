@@ -34,6 +34,14 @@ class PlannerTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "must be true or false"):
                 load_config(path)
 
+    def test_oss_url_is_required(self):
+        example = Path(__file__).parent.parent / "config.example.toml"
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "config.toml"
+            path.write_text(example.read_text().replace('oss_url = "http://127.0.0.1:8240"', ""))
+            with self.assertRaisesRegex(ValueError, "oss_url"):
+                load_config(path)
+
     def test_example_config_keeps_runtime_data_outside_checkout(self):
         config, _, _, _ = fixture()
         checkout = Path(__file__).resolve().parent.parent
@@ -165,8 +173,12 @@ class FakeCli:
 
 
 class DevtoolTests(unittest.IsolatedAsyncioTestCase):
-    async def test_wallets_share_public_evidence_directory(self):
-        config, _, _, _ = fixture()
+    async def test_oss_settings_reach_devtool(self):
+        example = Path(__file__).parent.parent / "config.example.toml"
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "config.toml"
+            path.write_text(example.read_text().replace("# oss_cookie_file", "oss_cookie_file"))
+            config = load_config(path)
         class FakeProcess:
             def __init__(self):
                 self.returncode = 0
@@ -177,11 +189,8 @@ class DevtoolTests(unittest.IsolatedAsyncioTestCase):
         call = spawn.await_args
         assert call is not None
         env = call.kwargs["env"]
-        self.assertEqual(
-            env["TACHYON_EVIDENCE_DIR"],
-            str(Path(str(config["wallet_root"])) / ".evidence"),
-        )
-
+        self.assertEqual(env["TACHYON_OSS_URL"], "http://127.0.0.1:8240")
+        self.assertEqual(env["TACHYON_OSS_COOKIE"], "/path/to/oss/.cookie")
 
     async def test_timing_flag_is_forwarded_and_logged(self):
         config, _, _, _ = fixture()

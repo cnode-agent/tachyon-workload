@@ -6,6 +6,9 @@ wallet_root = "../tachyon-workload-data/wallets"
 state_dir = "../tachyon-workload-data/state"
 activation_height = 8
 # cookie_file = "/path/to/node/.cookie"
+# Oblivious Synchronization Service: closed-epoch evidence for every wallet.
+oss_url = "http://127.0.0.1:8240"
+# oss_cookie_file = "/path/to/oss/.cookie"
 wallet_count = 32
 max_transactions = 8
 concurrency = 4
