@@ -1,5 +1,7 @@
 """Offline regression tests; no real keys, funds, or node required."""
 
+import io
+import json
 import os
 from pathlib import Path
 import random
@@ -9,7 +11,7 @@ from unittest.mock import AsyncMock, patch
 
 from .planner import FEE, choose_payment, funding_payment
 from .runner import Runner
-from .runtime import CliError, Devtool, Journal, load_config, private_dir
+from .runtime import CliError, Devtool, Journal, OssNotReady, load_config, private_dir
 
 
 def fixture():
@@ -132,6 +134,12 @@ class JournalTests(unittest.TestCase):
         self.journal.reconcile("alice", [{"operation_id": op["id"], "txid": "tx", "status": "pending"}])
         self.assertEqual(self.journal.unfinished()[0]["id"], op["id"])
 
+    def test_unfinished_prewarm_rounds_block_upgrade(self):
+        self.journal.new_round("tip", 12, "deferred", 1)
+        self.journal.close()
+        with self.assertRaisesRegex(RuntimeError, "prewarm"):
+            Journal(self.path)
+
     def test_duplicate_sidecar_and_public_directory_rejected(self):
         with self.assertRaisesRegex(RuntimeError, "another sidecar"):
             Journal(self.path)
@@ -192,6 +200,22 @@ class DevtoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(env["TACHYON_OSS_URL"], "http://127.0.0.1:8240")
         self.assertEqual(env["TACHYON_OSS_COOKIE"], "/path/to/oss/.cookie")
 
+    async def test_oss_not_ready_is_classified_from_full_stderr(self):
+        config, _, _, _ = fixture()
+        class FakeProcess:
+            def __init__(self, stderr):
+                self.returncode = 1
+                self.communicate = AsyncMock(return_value=(b"", stderr))
+
+        timing = b"\n" + b"TACHYON_TIMING {}\n" * 200  # pushes the phrase out of the message tail
+        for stderr, error in ((b"Error: OSS not ready: evidence building" + timing, OssNotReady),
+                              (b"Error: note already spent", CliError)):
+            with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=FakeProcess(stderr))):
+                with self.assertRaises(error) as raised:
+                    await Devtool(config).call("alice", "send")
+            self.assertIs(type(raised.exception), error)
+
+
     async def test_timing_flag_is_forwarded_and_logged(self):
         config, _, _, _ = fixture()
         config["timing"] = True
@@ -218,7 +242,6 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         config, _, _, _ = fixture()
         config.update(state_dir=Path(self.temp.name) / "state", wallet_root=Path(self.temp.name) / "wallets")
         self.runner = Runner(config, seed=1)
-        self.runner.evidence_ready = AsyncMock(return_value=True)
 
     async def asyncTearDown(self):
         self.runner.journal.close()
@@ -241,6 +264,88 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(runner.cli.imports, 2)
         self.assertEqual(runner.journal.get(operation["id"])["receipt_delivered"], 1)
         self.assertEqual(len(list(runner.receipts.glob("*.json"))), 1)
+
+    async def test_oss_gate_requires_evidence_through_previous_epoch(self):
+        runner = self.runner
+        requests = []
+        def oss_info(ready):
+            def open(request, timeout):
+                requests.append(request)
+                result = {"evidenceReadyThrough": ready, "tip": {"epoch": 3}}
+                return io.BytesIO(json.dumps({"jsonrpc": "2.0", "id": 1, "result": result}).encode())
+            return open
+        for epoch, ready, expected in ((0, None, True), (3, None, False), (3, 1, False),
+                                       (3, 2, True), (3, 3, True)):
+            runner.oss.opener.open = oss_info(ready)
+            feed = {"poolHeight": epoch * 4096 + 7, "epochLength": 4096}
+            self.assertIs(await runner.oss_ready(feed), expected, (epoch, ready))
+        self.assertEqual(len(requests), 4)  # epoch 0 never asks the OSS
+        self.assertEqual(requests[0].full_url, "http://127.0.0.1:8240")
+        body = json.loads(requests[0].data)
+        self.assertEqual((body["method"], body["params"]), ("oss_info", {}))
+
+    async def test_closed_oss_gate_mines_without_planning_payments(self):
+        runner = self.runner
+        runner.network = AsyncMock(return_value=({"blocks": 4200, "bestblockhash": "tip"}, "identity"))
+        runner.snapshot = AsyncMock(return_value={})
+        runner.recover = AsyncMock(return_value=True)
+        runner.execute = AsyncMock()
+        runner.oss = AsyncMock()
+        runner.oss.call.return_value = {"evidenceReadyThrough": None}
+        replies = {"getrawmempool": [], "getbestblockhash": "tip", "generate": ["next"],
+                   "gettachyonblock": {"poolHeight": 4192, "epochLength": 4096},
+                   "getblock": dict(previousblockhash="tip", tx=["coinbase"], height=4201, hash="next")}
+        runner.rpc = AsyncMock()
+        runner.rpc.call.side_effect = lambda method, params=None: replies[method]
+        self.assertTrue(await runner.round("controlled", bootstrap=True))
+        runner.oss.call.assert_awaited_once_with("oss_info", {})
+        runner.execute.assert_not_awaited()
+        self.assertEqual(runner.journal.round_operations(1), [])
+        self.assertEqual(sum(call.args[0] == "generate" for call in runner.rpc.call.await_args_list), 1)
+        self.assertFalse(runner.journal.active_rounds())
+
+    async def test_oss_not_ready_defers_payment_and_retries_same_operation(self):
+        class OssCli:
+            def __init__(self):
+                self.ready = False
+                self.saved = None
+                self.sent = []
+
+            async def call(self, wallet, *args):
+                if args[0] == "operation":
+                    if self.saved is None:
+                        raise CliError("unknown operation ID")
+                    return self.saved
+                if args[0] == "shield":
+                    self.sent.append(args[args.index("--operation-id") + 1])
+                    if not self.ready:
+                        raise OssNotReady("Error: OSS not ready (evidence building)")
+                    self.saved = dict(txid="tx", status="pending")
+                    return {}
+                raise AssertionError(args)
+
+        runner = self.runner
+        runner.cli = OssCli()
+        runner.wallets = ["alice"]
+        runner.wallet_tips["alice"] = (12, "tip")
+        runner.network = AsyncMock(return_value=({"blocks": 12, "bestblockhash": "tip"}, "identity"))
+        runner.snapshot = AsyncMock(return_value={})
+        replies = {"getrawmempool": ["tx"], "getbestblockhash": "tip", "generate": ["next"],
+                   "getblock": dict(previousblockhash="tip", tx=["coinbase", "tx"], height=13, hash="next")}
+        runner.rpc = AsyncMock()
+        runner.rpc.call.side_effect = lambda method, params=None: replies[method]
+        round_id = runner.journal.new_round("tip", 12, "controlled", 1)
+        operation = runner.journal.plan(round_id, "alice", None, ["shield", "123"])
+        self.assertFalse(await runner.round("controlled"))
+        self.assertEqual(runner.journal.get(operation["id"])["status"], "planned")
+        self.assertTrue(runner.journal.active_rounds())
+        runner.rpc.call.assert_not_awaited()
+        runner.cli.ready = True
+        self.assertTrue(await runner.round("controlled"))
+        self.assertEqual(runner.cli.sent, [operation["id"]] * 2)
+        self.assertEqual(runner.journal.get(operation["id"])["txid"], "tx")
+        self.assertFalse(runner.journal.active_rounds())
+        self.assertEqual(sum(call.args[0] == "generate" for call in runner.rpc.call.await_args_list), 1)
 
     async def test_snapshot_skips_full_history_without_active_operations(self):
         class StatusCli:

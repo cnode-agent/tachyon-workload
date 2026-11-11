@@ -113,16 +113,27 @@ allows other traffic. Restart the service after changing the config.
 The cap is a **load limit**, not the consensus maximum: block capacity depends on
 serialized size, actions, and validation cost. Start small. Devtool reconstructs
 proofs from local public inputs and routes closed epochs into buckets bounded by
-Tachyon's polynomial capacity. Prewarming removes that finalization work from
+Tachyon's polynomial capacity. The OSS removes that finalization work from
 normal payments; it does not increase any protocol or wallet capacity limits.
 
-## Epoch-close prewarm
+## Oblivious Synchronization Service
 
-Use a devtool build with `tachyon prewarm-epochs` and `evidence-generation`. No new config is required. Once the next epoch's entry block exists, the sidecar syncs public history and prewarms all closed-epoch bucket profiles through the shared `wallet_root/.evidence/evidence.sqlite` cache. Four workers (or your configured `concurrency`) share durable leases across wallets.
+Wallets get closed-epoch proof evidence from a `tachyon-oss` service instead of
+building it themselves. Set `oss_url` (required; the OSS listens on
+`127.0.0.1:8240` by default) and, if the OSS uses cookie auth, `oss_cookie_file`.
+The sidecar passes them to every devtool command as `TACHYON_OSS_URL` and
+`TACHYON_OSS_COOKIE`. Use a devtool build with OSS support.
 
-While prewarm runs, controlled mode continues generating blocks without planning new payments. These blocks are empty unless previously broadcast or permitted external transactions are waiting. `epoch_prewarm` logs show `started` and `ready`. Payments resume only after the profiles are verified and the cache generation still matches. An ordinary epoch advance does not cancel unfinished work; a reorg does. Proof errors fail closed rather than enabling payments or retrying blindly.
+Before planning new payments in epoch `e > 0`, the sidecar calls `oss_info` and
+requires `evidenceReadyThrough >= e - 1`. Until then it logs `oss_not_ready` and
+plans nothing; controlled mode keeps mining, so these blocks are empty unless
+earlier broadcasts or permitted external transactions are waiting. If devtool
+gives up with `OSS not ready`, the payment logs `payment_deferred` and keeps its
+journaled ID and arguments. Its round is neither finished nor mined, and the next
+round retries it. An unreachable OSS is an error, like an unreachable node.
 
-Interrupted payment IDs and arguments remain in the journal. Unsubmitted rounds are deferred until evidence is ready; already-broadcast transactions may be mined meanwhile. A timed-out mining request is still reconciled against its original successor before another request. Restarting does not delete wallet data or evidence, and an abandoned proof lease can be recovered after 30 seconds.
+Stop the previous release only between rounds, not while `epoch_prewarm` is
+running: the journal refuses to open with unfinished prewarm rounds.
 
 ## Optional external faucet
 

@@ -110,7 +110,7 @@ class Rpc:
             if self.config.get("cookie_file"):
                 cookie = self.config["cookie_file"].read_text().strip()
                 headers["Authorization"] = "Basic " + base64.b64encode(cookie.encode()).decode()
-            data = json.dumps(dict(jsonrpc="2.0", id=1, method=method, params=params or [])).encode()
+            data = json.dumps(dict(jsonrpc="2.0", id=1, method=method, params=[] if params is None else params)).encode()
             req = urllib.request.Request(self.config["rpc_url"], data, headers)
             with self.opener.open(req, timeout=30) as response:
                 payload = response.read(16 * 1024 * 1024 + 1)
@@ -127,23 +127,20 @@ class CliError(RuntimeError):
     pass
 
 
+class OssNotReady(CliError):
+    pass
+
+
 class Devtool:
     def __init__(self, config):
         self.config = config
         self.slots = asyncio.Semaphore(config["concurrency"])
         self.locks = {}
-        self.prewarm_slots = asyncio.Semaphore(config["concurrency"])
 
     async def call(self, wallet, *args):
         lock = self.locks.setdefault(wallet, asyncio.Lock())
         async with lock, self.slots:
             return await self._run(wallet, args)
-
-    async def prewarm(self, wallet):
-        # The command only reads wallet history; its long proof computation
-        # must not hold a wallet command slot needed by journal recovery.
-        async with self.prewarm_slots:
-            return await self._run(wallet, ("prewarm-epochs",))
 
     async def _run(self, wallet, args):
         env = {**os.environ, "TACHYON_OSS_URL": self.config["oss_url"]}
@@ -169,9 +166,11 @@ class Devtool:
                     process.kill()
                     await process.wait()
             raise
-        self.log_timing(stderr.decode(errors="replace"), wallet, args)
+        stderr = stderr.decode(errors="replace")
+        self.log_timing(stderr, wallet, args)
         if process.returncode:
-            raise CliError(stderr.decode(errors="replace").strip()[-2000:])
+            # Devtool's pinned phrase when it gives up waiting for the OSS (design 4.3).
+            raise (OssNotReady if "OSS not ready" in stderr else CliError)(stderr.strip()[-2000:])
         return json.loads(stdout)
 
     @staticmethod
@@ -224,9 +223,10 @@ class Journal:
                 receipt_delivered INTEGER NOT NULL DEFAULT 0);
         """)
 
-        if "expected" not in {row[1] for row in self.db.execute("PRAGMA table_info(rounds)")}:
-            self.db.execute("ALTER TABLE rounds ADD COLUMN expected TEXT NOT NULL DEFAULT '[]'")
-            self.db.commit()
+        if self.db.execute("SELECT 1 FROM rounds WHERE finished=0 AND mode IN ('prewarm','deferred')").fetchone():
+            self.close()
+            raise RuntimeError("journal has unfinished prewarm rounds; let the previous release "
+                               "finish them before upgrading")
 
     def close(self):
         self.db.close()
@@ -251,29 +251,11 @@ class Journal:
         with self.db:
             self.db.execute("DELETE FROM metadata WHERE key=?", ("reconcile:" + wallet,))
 
-    def defer(self, round_id):
-        with self.db:
-            self.db.execute("UPDATE rounds SET mode='deferred' WHERE id=? AND mining_requested=0", (round_id,))
-
-    def resume_deferred(self, tip, height, mode):
-        deferred = [r[0] for r in self.db.execute("SELECT id FROM rounds WHERE mode='deferred' AND finished=0")]
-        if not deferred:
-            return
-        # Reconcile first: operations mined during prewarm keep their original
-        # IDs and are not requested again. Remaining operations share a new tip.
-        with self.db:
-            self.db.execute("INSERT INTO rounds(tip,height,mode,target) VALUES(?,?,?,0)", (tip,height,mode))
-            round_id = self.db.execute("SELECT last_insert_rowid()").fetchone()[0]
-            for previous in deferred:
-                self.db.execute("UPDATE operations SET round_id=? WHERE round_id=? AND status NOT IN ('mined','expired')",
-                                (round_id,previous))
-                self.db.execute("UPDATE rounds SET finished=1 WHERE id=?", (previous,))
-
-    def new_round(self, tip, height, mode, target, expected=None):
+    def new_round(self, tip, height, mode, target):
         with self.db:
             cursor = self.db.execute(
-                "INSERT OR IGNORE INTO rounds(tip,height,mode,target,expected) VALUES (?,?,?,?,?)",
-                (tip, height, mode, target, json.dumps(expected or [])))
+                "INSERT OR IGNORE INTO rounds(tip,height,mode,target) VALUES (?,?,?,?)",
+                (tip, height, mode, target))
         if not cursor.rowcount:
             return None
         return cursor.lastrowid
@@ -322,7 +304,7 @@ class Journal:
             self.db.execute("UPDATE rounds SET mining_requested=1 WHERE id=?", (round_id,))
 
     def active_rounds(self):
-        return [dict(row) for row in self.db.execute("SELECT * FROM rounds WHERE finished=0 AND mode != 'deferred' ORDER BY id")]
+        return [dict(row) for row in self.db.execute("SELECT * FROM rounds WHERE finished=0 ORDER BY id")]
 
     def round_operations(self, round_id):
         return [dict(row) for row in self.db.execute("SELECT * FROM operations WHERE round_id=?", (round_id,))]

@@ -397,6 +397,7 @@ class FaucetRunnerTests(unittest.IsolatedAsyncioTestCase):
             txid = digest(op["id"])
             runner.journal.update(op["id"], status="pending", txid=txid)
             self.mempool.append(txid)
+            return True
 
         runner.execute = execute
         await runner.round("controlled")

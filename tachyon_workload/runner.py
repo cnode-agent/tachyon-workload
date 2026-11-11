@@ -8,7 +8,7 @@ import random
 
 from .planner import choose_payment, funding_payment
 from .faucet import Faucet
-from .runtime import CliError, Devtool, Journal, Rpc, emit, private_dir
+from .runtime import CliError, Devtool, Journal, OssNotReady, Rpc, emit, private_dir
 
 
 class Runner:
@@ -18,6 +18,7 @@ class Runner:
         self.faucet = Faucet(self.journal, config.get("faucet"))
         self.receipts = private_dir(config["state_dir"] / "receipts")
         self.rpc = Rpc(config)
+        self.oss = Rpc({"rpc_url": config["oss_url"], "cookie_file": config.get("oss_cookie_file")})
         self.cli = Devtool(config)
         self.rng = random.Random(seed)
         self.wallets = ["treasury"] + [f"sim-{i:03}" for i in range(1, config["wallet_count"] + 1)]
@@ -27,10 +28,6 @@ class Runner:
             self.journal.require_reconcile(wallet)
         self.addresses = {}
         self.wallet_tips = {}
-        self.prewarm_task = None
-        self.prewarm_key = None
-        self.prewarm_ready = None
-        self.prewarm_token = None
         self.journal.pin("wallet_root", str(config["wallet_root"]))
 
     async def network(self):
@@ -148,9 +145,14 @@ class Runner:
                 await self.cli.call(operation["wallet"], *json.loads(operation["args"]),
                                     "--operation-id", operation["id"],
                                     "--expected-tip", self.wallet_tips[operation["wallet"]][1])
-            except (CliError, TimeoutError):
+            except (CliError, TimeoutError) as error:
                 saved = await self.lookup(operation)
                 if saved is None:
+                    if isinstance(error, OssNotReady):
+                        # Nothing was signed: the journaled ID and arguments retry next round.
+                        emit("payment_deferred", wallet=operation["wallet"], kind=operation["kind"],
+                             operation_id=operation["id"], reason="OSS not ready")
+                        return False
                     # Keep the request and its ID; never make a blind replacement.
                     raise
             else:
@@ -172,12 +174,15 @@ class Runner:
             emit("faucet_payment", purpose=faucet["purpose"], policy_id=faucet["policy_id"],
                  amount_zat=faucet["amount_zat"], txid=saved["txid"], status=saved["status"],
                  operation_id=operation["id"])
+        return True
 
     async def recover(self):
+        done = True
         for operation in self.journal.unfinished():
             if operation["wallet"] not in self.wallets or (operation["recipient"] and operation["recipient"] not in self.wallets):
                 raise RuntimeError("pending operation needs an excluded wallet; restore wallet_count")
-            await self.execute(operation)
+            done = await self.execute(operation) and done
+        return done
 
     def matches_round(self, transactions, expected):
         actual = set(transactions)
@@ -189,8 +194,7 @@ class Runner:
         round_record = next(row for row in self.journal.active_rounds() if row["id"] == round_record["id"])
         tip = await self.rpc.call("getbestblockhash")
         operations = self.journal.round_operations(round_record["id"])
-        expected = (set(json.loads(round_record["expected"])) if round_record["mode"] == "prewarm"
-                    else {op["txid"] for op in operations if op["status"] != "expired"})
+        expected = {op["txid"] for op in operations if op["status"] != "expired"}
         if None in expected:
             raise RuntimeError("round contains an unresolved operation; retry with the same journal")
         if tip != round_record["tip"]:
@@ -219,126 +223,28 @@ class Runner:
         emit("mined", height=block["height"], transactions=len(expected), target=round_record["target"], hash=block["hash"],
              external_transactions=len(set(block["tx"][1:]) - expected))
 
-    async def prewarm(self):
-        async def sync(wallet):
-            result = await self.cli.sync(wallet)
-            if result.get("reorg"):
-                self.journal.require_reconcile(wallet)
-        async def phase(coroutines):
-            tasks = [asyncio.create_task(coroutine) for coroutine in coroutines]
-            try:
-                return await asyncio.gather(*tasks)
-            finally:
-                for task in tasks:
-                    if not task.done():
-                        task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
-        # Finish reorg invalidations in every wallet before any builder acquires
-        # a lease. Mining continues independently through both phases.
-        await phase(sync(wallet) for wallet in self.wallets)
-        return await phase(self.cli.prewarm(wallet) for wallet in self.wallets)
-
-    @staticmethod
-    def evidence_token(status):
-        return status["namespace"], status["generation"]
-
-    async def evidence_ready(self, info, mode):
-        feed = await self.rpc.call("gettachyonblock", [str(info["blocks"])])
+    async def oss_ready(self, feed):
+        # Payments in epoch e need closed-epoch evidence through e - 1.
         epoch = feed["poolHeight"] // feed["epochLength"]
         if epoch == 0:
-            key = None
-        else:
-            entry = self.config["activation_height"] + epoch * feed["epochLength"]
-            key = (epoch, await self.rpc.call("getblockhash", [entry]))
-        if self.prewarm_task:
-            job_epoch, job_hash = self.prewarm_key
-            job_entry = self.config["activation_height"] + job_epoch * feed["epochLength"]
-            canonical = epoch >= job_epoch and await self.rpc.call("getblockhash", [job_entry]) == job_hash
-            if not canonical:
-                self.prewarm_task.cancel()
-                await asyncio.gather(self.prewarm_task, return_exceptions=True)
-                self.prewarm_task = None
-                self.prewarm_ready = None
-            elif self.prewarm_task.done():
-                try:
-                    results = self.prewarm_task.result()
-                except CliError as error:
-                    status = await self.cli.call("treasury", "evidence-generation")
-                    if "invalidated" not in str(error) or self.evidence_token(status) == self.prewarm_token:
-                        raise  # Unknown/proof failures are never retried blindly.
-                    self.prewarm_task = None
-                    self.prewarm_ready = None
-                    emit("epoch_prewarm", state="invalidated", epoch=job_epoch - 1)
-                else:
-                    if any(result["through_epoch"] is None or result["through_epoch"] < job_epoch - 1 for result in results):
-                        raise RuntimeError("prewarm did not cover the closed epoch; sync public evidence before paying")
-                    generations = {self.evidence_token(result) for result in results}
-                    if len(generations) != 1:
-                        raise RuntimeError("evidence invalidated during prewarm; refusing payments")
-                    self.prewarm_ready = (self.prewarm_key, generations.pop())
-                    self.prewarm_task = None
-                    emit("epoch_prewarm", state="ready", epoch=job_epoch - 1,
-                         profile_checks=sum(result["profiles"] for result in results))
-        if key is None:
             return True
-        if self.prewarm_ready is not None and self.prewarm_ready[0] == key:
-            status = await self.cli.call("treasury", "evidence-generation")
-            if self.evidence_token(status) == self.prewarm_ready[1]:
-                return True
-            self.prewarm_ready = None
-        if self.prewarm_task is None:
-            self.prewarm_key = key
-            self.prewarm_token = self.evidence_token(await self.cli.call("treasury", "evidence-generation"))
-            self.prewarm_task = asyncio.create_task(self.prewarm())
-            emit("epoch_prewarm", state="started", epoch=epoch - 1, entry_hash=key[1])
-        # An ordinary epoch advance must not cancel a long-running build. Once
-        # it finishes, catch up newer epochs while continuing to mine.
-        if mode == "controlled":
-            # Preserve an interrupted payment's ID and arguments. No payment is
-            # created while prewarming; existing broadcasts can still be mined.
-            for record in self.journal.active_rounds():
-                if record["mode"] == "prewarm" or record["mining_requested"]:
-                    await self.mine_round(record)
-                else:
-                    self.journal.defer(record["id"])
-            tip = await self.rpc.call("getbestblockhash")
-            current = await self.rpc.call("getblock", [tip, 1])
-            mempool = await self.rpc.call("getrawmempool")
-            if mempool and not self.config["allow_external_transactions"]:
-                known = set()
-                for operation in self.journal.unfinished():
-                    saved = await self.lookup(operation)
-                    if saved:
-                        known.add(saved["txid"])
-                if set(mempool) - known:
-                    raise RuntimeError("unexpected external mempool traffic during prewarm")
-            round_id = self.journal.new_round(tip, current["height"], "prewarm", 0, expected=mempool)
-            if round_id is not None:
-                record = next(row for row in self.journal.active_rounds() if row["id"] == round_id)
-                await self.mine_round(record)
-            # Yield even with immediate fake RPCs, and let background sync/proving run.
-            await asyncio.sleep(0)
+        ready = (await self.oss.call("oss_info", {}))["evidenceReadyThrough"]
+        if ready is not None and ready >= epoch - 1:
+            return True
+        emit("oss_not_ready", epoch=epoch, evidence_ready_through=ready)
         return False
 
     async def round(self, mode, bootstrap=False):
-        info, _ = await self.network()
-        if not await self.evidence_ready(info, mode):
-            return True  # Background proof work never blocks empty block production.
+        await self.network()
         balances = await self.snapshot()
-        # Sync can discover an in-epoch reorg that leaves the entry hash intact.
-        # Check the cache generation again before recovery or planning payments.
-        info, _ = await self.network()
-        if not await self.evidence_ready(info, mode):
-            return True
         if not await self.sync_faucet():
             return False  # Bounded historical scan; do not spend against incomplete accounting.
-        info, _ = await self.network()
-        self.journal.resume_deferred(info["bestblockhash"], info["blocks"], mode)
-        await self.recover()
+        if not await self.recover():
+            return False  # OSS not ready; the unfinished round is retried, not mined.
         active = self.journal.active_rounds()
         if active:
             for record in active:
-                if record["mode"] in ("controlled", "prewarm"):
+                if record["mode"] == "controlled":
                     if mode != "controlled":
                         raise RuntimeError("resume unfinished controlled round in controlled mode")
                     await self.mine_round(record)
@@ -351,6 +257,10 @@ class Runner:
                 await self.rpc.call("getrawmempool")):
             raise RuntimeError("controlled mode requires an empty mempool before a new round")
         target = 1 if bootstrap else self.rng.randint(0, self.config["max_transactions"])
+        if target:
+            feed = await self.rpc.call("gettachyonblock", [str(height)])
+            if not await self.oss_ready(feed):
+                target = 0  # No new payments yet; controlled mode still mines this round.
         round_id = self.journal.new_round(tip, height, mode, target)
         if round_id is None:
             return False
@@ -358,7 +268,6 @@ class Runner:
         if target:
             busy = {operation["wallet"] for operation in self.journal.unfinished()}
             utxos = await self.funding_utxos(busy, balances)
-            feed = await self.rpc.call("gettachyonblock", [str(height)])
             tachyon_allowed = (feed["poolHeight"] + 1) % feed["epochLength"] != 0
             payments = []
             faucet_payment = self.faucet.payment(balances, utxos, busy, tachyon_allowed)
@@ -384,7 +293,8 @@ class Runner:
             operations = [self.journal.plan(round_id, *payment,
                             faucet=faucet_payment[1] if faucet_payment and index == 0 else None)
                           for index, payment in enumerate(payments)]
-            await asyncio.gather(*(self.execute(operation) for operation in operations))
+            if not all(await asyncio.gather(*(self.execute(operation) for operation in operations))):
+                return False  # OSS not ready; the unfinished round is retried, not mined.
             if len(operations) < target:
                 emit("underfilled", target=target, planned=len(operations),
                      reason="insufficient independent confirmed inputs or epoch boundary")
@@ -396,14 +306,6 @@ class Runner:
         return True
 
     async def run(self, mode, rounds, bootstrap=False):
-        try:
-            await self.run_rounds(mode, rounds, bootstrap)
-        finally:
-            if self.prewarm_task:
-                self.prewarm_task.cancel()
-                await asyncio.gather(self.prewarm_task, return_exceptions=True)
-
-    async def run_rounds(self, mode, rounds, bootstrap=False):
         done = 0
         last_tip = None
         while not rounds or done < rounds:
