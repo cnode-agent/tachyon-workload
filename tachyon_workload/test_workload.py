@@ -209,6 +209,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         config, _, _, _ = fixture()
         config.update(state_dir=Path(self.temp.name) / "state", wallet_root=Path(self.temp.name) / "wallets")
         self.runner = Runner(config, seed=1)
+        self.runner.evidence_ready = AsyncMock(return_value=True)
 
     async def asyncTearDown(self):
         self.runner.journal.close()

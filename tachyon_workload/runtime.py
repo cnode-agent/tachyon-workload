@@ -129,36 +129,46 @@ class Devtool:
         self.config = config
         self.slots = asyncio.Semaphore(config["concurrency"])
         self.locks = {}
+        self.prewarm_slots = asyncio.Semaphore(config["concurrency"])
 
     async def call(self, wallet, *args):
         lock = self.locks.setdefault(wallet, asyncio.Lock())
         async with lock, self.slots:
-            env = {**os.environ,
-                   "TACHYON_EVIDENCE_DIR": str(self.config["wallet_root"] / ".evidence")}
-            if self.config["timing"]:
-                env["TACHYON_TIMING"] = "1"
-            process = await asyncio.create_subprocess_exec(
-                str(self.config["devtool"]), "tachyon", "--wallet-dir",
-                str(self.config["wallet_root"] / wallet), *map(str, args),
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                env=env)
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(), self.config["command_timeout"])
-            except BaseException:
-                # Do not leave a writer running after an ambiguous timeout/cancellation.
-                if process.returncode is None:
-                    process.terminate()
-                    try:
-                        await asyncio.wait_for(process.wait(), 5)
-                    except TimeoutError:
-                        process.kill()
-                        await process.wait()
-                raise
-            self.log_timing(stderr.decode(errors="replace"), wallet, args)
-            if process.returncode:
-                raise CliError(stderr.decode(errors="replace").strip()[-2000:])
-            return json.loads(stdout)
+            return await self._run(wallet, args)
+
+    async def prewarm(self, wallet):
+        # The command only reads wallet history; its long proof computation
+        # must not hold a wallet command slot needed by journal recovery.
+        async with self.prewarm_slots:
+            return await self._run(wallet, ("prewarm-epochs",))
+
+    async def _run(self, wallet, args):
+        env = {**os.environ,
+               "TACHYON_EVIDENCE_DIR": str(self.config["wallet_root"] / ".evidence")}
+        if self.config["timing"]:
+            env["TACHYON_TIMING"] = "1"
+        process = await asyncio.create_subprocess_exec(
+            str(self.config["devtool"]), "tachyon", "--wallet-dir",
+            str(self.config["wallet_root"] / wallet), *map(str, args),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            env=env)
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), self.config["command_timeout"])
+        except BaseException:
+            # Do not leave a writer running after an ambiguous timeout/cancellation.
+            if process.returncode is None:
+                process.terminate()
+                try:
+                    await asyncio.wait_for(process.wait(), 5)
+                except TimeoutError:
+                    process.kill()
+                    await process.wait()
+            raise
+        self.log_timing(stderr.decode(errors="replace"), wallet, args)
+        if process.returncode:
+            raise CliError(stderr.decode(errors="replace").strip()[-2000:])
+        return json.loads(stdout)
 
     @staticmethod
     def log_timing(stderr, wallet, args):
@@ -173,10 +183,12 @@ class Devtool:
                 continue
 
     async def sync(self, wallet):
+        reorg = False
         for _ in range(100):
             result = await self.call(wallet, "sync", "--max-blocks", 10000)
+            reorg |= result.get("reorg", False)
             if result["caught_up"]:
-                return result
+                return {**result, "reorg": reorg}
         raise RuntimeError(f"{wallet}: sync exceeded 1,000,000 blocks; rerun to continue")
 
 
@@ -208,6 +220,10 @@ class Journal:
                 receipt_delivered INTEGER NOT NULL DEFAULT 0);
         """)
 
+        if "expected" not in {row[1] for row in self.db.execute("PRAGMA table_info(rounds)")}:
+            self.db.execute("ALTER TABLE rounds ADD COLUMN expected TEXT NOT NULL DEFAULT '[]'")
+            self.db.commit()
+
     def close(self):
         self.db.close()
         self.lock.close()
@@ -220,11 +236,40 @@ class Journal:
         with self.db:
             self.db.execute("INSERT OR IGNORE INTO metadata VALUES (?,?)", (key, encoded))
 
-    def new_round(self, tip, height, mode, target):
+    def require_reconcile(self, wallet):
+        with self.db:
+            self.db.execute("INSERT OR REPLACE INTO metadata VALUES(?, 'true')", ("reconcile:" + wallet,))
+
+    def needs_reconcile(self, wallet):
+        return self.db.execute("SELECT 1 FROM metadata WHERE key=?", ("reconcile:" + wallet,)).fetchone() is not None
+
+    def reconciled(self, wallet):
+        with self.db:
+            self.db.execute("DELETE FROM metadata WHERE key=?", ("reconcile:" + wallet,))
+
+    def defer(self, round_id):
+        with self.db:
+            self.db.execute("UPDATE rounds SET mode='deferred' WHERE id=? AND mining_requested=0", (round_id,))
+
+    def resume_deferred(self, tip, height, mode):
+        deferred = [r[0] for r in self.db.execute("SELECT id FROM rounds WHERE mode='deferred' AND finished=0")]
+        if not deferred:
+            return
+        # Reconcile first: operations mined during prewarm keep their original
+        # IDs and are not requested again. Remaining operations share a new tip.
+        with self.db:
+            self.db.execute("INSERT INTO rounds(tip,height,mode,target) VALUES(?,?,?,0)", (tip,height,mode))
+            round_id = self.db.execute("SELECT last_insert_rowid()").fetchone()[0]
+            for previous in deferred:
+                self.db.execute("UPDATE operations SET round_id=? WHERE round_id=? AND status NOT IN ('mined','expired')",
+                                (round_id,previous))
+                self.db.execute("UPDATE rounds SET finished=1 WHERE id=?", (previous,))
+
+    def new_round(self, tip, height, mode, target, expected=None):
         with self.db:
             cursor = self.db.execute(
-                "INSERT OR IGNORE INTO rounds(tip,height,mode,target) VALUES (?,?,?,?)",
-                (tip, height, mode, target))
+                "INSERT OR IGNORE INTO rounds(tip,height,mode,target,expected) VALUES (?,?,?,?,?)",
+                (tip, height, mode, target, json.dumps(expected or [])))
         if not cursor.rowcount:
             return None
         return cursor.lastrowid
@@ -273,7 +318,7 @@ class Journal:
             self.db.execute("UPDATE rounds SET mining_requested=1 WHERE id=?", (round_id,))
 
     def active_rounds(self):
-        return [dict(row) for row in self.db.execute("SELECT * FROM rounds WHERE finished=0 ORDER BY id")]
+        return [dict(row) for row in self.db.execute("SELECT * FROM rounds WHERE finished=0 AND mode != 'deferred' ORDER BY id")]
 
     def round_operations(self, round_id):
         return [dict(row) for row in self.db.execute("SELECT * FROM operations WHERE round_id=?", (round_id,))]

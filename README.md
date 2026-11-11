@@ -111,10 +111,18 @@ as `external_transactions`. This option defaults to `false`; live mode already
 allows other traffic. Restart the service after changing the config.
 
 The cap is a **load limit**, not the consensus maximum: block capacity depends on
-serialized size, actions, and validation cost. Start small. Devtool currently
-reconstructs proofs from local public inputs and limits closed epochs to 65,536
-tachygrams. Sustained full-block stress testing needs scalable proof evidence,
-more independent inputs, and throughput work beyond this initial sidecar.
+serialized size, actions, and validation cost. Start small. Devtool reconstructs
+proofs from local public inputs and routes closed epochs into buckets bounded by
+Tachyon's polynomial capacity. Prewarming removes that finalization work from
+normal payments; it does not increase any protocol or wallet capacity limits.
+
+## Epoch-close prewarm
+
+Use a devtool build with `tachyon prewarm-epochs` and `evidence-generation`. No new config is required. Once the next epoch's entry block exists, the sidecar syncs public history and prewarms all closed-epoch bucket profiles through the shared `wallet_root/.evidence/evidence.sqlite` cache. Four workers (or your configured `concurrency`) share durable leases across wallets.
+
+While prewarm runs, controlled mode continues generating blocks without planning new payments. These blocks are empty unless previously broadcast or permitted external transactions are waiting. `epoch_prewarm` logs show `started` and `ready`. Payments resume only after the profiles are verified and the cache generation still matches. An ordinary epoch advance does not cancel unfinished work; a reorg does. Proof errors fail closed rather than enabling payments or retrying blindly.
+
+Interrupted payment IDs and arguments remain in the journal. Unsubmitted rounds are deferred until evidence is ready; already-broadcast transactions may be mined meanwhile. A timed-out mining request is still reconciled against its original successor before another request. Restarting does not delete wallet data or evidence, and an abandoned proof lease can be recovered after 30 seconds.
 
 ## Optional external faucet
 
