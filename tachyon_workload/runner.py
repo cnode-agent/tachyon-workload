@@ -179,12 +179,15 @@ class Runner:
         return True
 
     async def recover(self):
-        done = True
-        for operation in self.journal.unfinished():
+        operations = self.journal.unfinished()
+        for operation in operations:
             if operation["wallet"] not in self.wallets or (operation["recipient"] and operation["recipient"] not in self.wallets):
                 raise RuntimeError("pending operation needs an excluded wallet; restore wallet_count")
-            done = await self.execute(operation) and done
-        return done
+        if not operations:
+            return True
+        # Run recovery with the same concurrency as a round. Sequential replay
+        # of heavy consolidations stalls the chain for minutes after a restart.
+        return all(await asyncio.gather(*(self.execute(operation) for operation in operations)))
 
     def matches_round(self, transactions, expected):
         actual = set(transactions)
