@@ -7,6 +7,15 @@ def available_notes(balance):
     return sorted(note["value_zat"] for note in balance["notes"] if note["status"] == "available")
 
 
+def available_note_count(balance):
+    return sum(1 for note in balance["notes"] if note["status"] == "available")
+
+
+def consolidation_payment(wallet, max_inputs):
+    """Merge the wallet's smallest notes (dust first) into one note."""
+    return (wallet, None, ["consolidate", "--max-inputs", str(max_inputs)])
+
+
 def funding_payment(config, balances, utxos, addresses, busy, protected_zat=0):
     if "treasury" in busy:
         return None

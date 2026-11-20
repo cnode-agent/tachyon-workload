@@ -49,6 +49,8 @@ def load_config(path):
                     timing=False,
                     min_amount_zat=100_000, max_amount_zat=2_000_000,
                     seed_amount_zat=10_000_000, seed_notes=3,
+                    note_target=256, consolidate_max_inputs=32,
+                    consolidate_slots=4,
                     weights={"send": 80, "unshield": 8, "shield": 8,
                              "transparent-send": 4})
     allowed = {*defaults, "rpc_url", "oss_url", "devtool", "wallet_root", "state_dir", "cookie_file",
@@ -72,6 +74,8 @@ def load_config(path):
     for name, minimum, maximum in (
         ("wallet_count", 2, 128), ("max_transactions", 0, 128),
         ("concurrency", 1, 16), ("activation_height", 1, 2**32 - 1),
+        ("note_target", 1, 1_000_000), ("consolidate_max_inputs", 2, 64),
+        ("consolidate_slots", 0, 16),
         ("poll_seconds", 1, 60), ("command_timeout", 30, 7200),
         ("min_amount_zat", 1, 10**12), ("max_amount_zat", 1, 10**12),
         ("seed_amount_zat", 1, 10**12), ("seed_notes", 1, 16),

@@ -6,7 +6,8 @@ import json
 import os
 import random
 
-from .planner import choose_payment, funding_payment
+from .planner import (available_note_count, choose_payment, consolidation_payment,
+                      funding_payment)
 from .faucet import Faucet
 from .runtime import CliError, Devtool, Journal, OssNotReady, Rpc, emit, private_dir
 
@@ -279,6 +280,23 @@ class Runner:
             if funding and tachyon_allowed:
                 payments.append(funding)
                 busy.add("treasury")
+            if tachyon_allowed:
+                # Keep note counts bounded: replace send slots with merges for
+                # the wallets furthest above the target (dust is taken first).
+                over = []
+                for wallet in self.wallets:
+                    if wallet == "treasury" or wallet in busy:
+                        continue
+                    count = available_note_count(balances[wallet])
+                    if count > self.config["note_target"]:
+                        over.append((count, wallet))
+                over.sort(reverse=True)
+                for _, wallet in over[: min(self.config["consolidate_slots"], target)]:
+                    if len(payments) >= target:
+                        break
+                    payments.append(consolidation_payment(
+                        wallet, self.config["consolidate_max_inputs"]))
+                    busy.add(wallet)
             if not bootstrap:
                 shuffled = [wallet for wallet in self.wallets if wallet not in busy]
                 self.rng.shuffle(shuffled)
