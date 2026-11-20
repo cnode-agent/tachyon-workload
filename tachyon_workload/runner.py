@@ -87,6 +87,7 @@ class Runner:
             self.journal.reconciled(wallet)
             self.wallet_tips[wallet] = (synced["height"], synced["hash"])
             emit("synced", wallet=wallet, height=synced["height"], tachyon_zat=balance["available_zat"],
+                 notes=available_note_count(balance),
                  transparent_available_zat=(balance.get("transparent") or {}).get("available_zat"))
             return wallet, balance
         return dict(await asyncio.gather(*(wallet_snapshot(wallet) for wallet in self.wallets)))
@@ -291,6 +292,8 @@ class Runner:
                     if count > self.config["note_target"]:
                         over.append((count, wallet))
                 over.sort(reverse=True)
+                emit("consolidation_scan", over=len(over), target=target,
+                     top=over[:3] or None)
                 for _, wallet in over[: min(self.config["consolidate_slots"], target)]:
                     if len(payments) >= target:
                         break
