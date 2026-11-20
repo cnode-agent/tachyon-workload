@@ -6,8 +6,7 @@ import json
 import os
 import random
 
-from .planner import (available_note_count, choose_payment, consolidation_payment,
-                      funding_payment)
+from .planner import available_note_count, choose_payment, funding_payment
 from .faucet import Faucet
 from .runtime import CliError, Devtool, Journal, OssNotReady, Rpc, emit, private_dir
 
@@ -29,6 +28,7 @@ class Runner:
             self.journal.require_reconcile(wallet)
         self.addresses = {}
         self.wallet_tips = {}
+        self.background = {}
         self.journal.pin("wallet_root", str(config["wallet_root"]))
 
     async def network(self):
@@ -179,7 +179,8 @@ class Runner:
         return True
 
     async def recover(self):
-        operations = self.journal.unfinished()
+        operations = [operation for operation in self.journal.unfinished()
+                      if not operation["background"]]
         for operation in operations:
             if operation["wallet"] not in self.wallets or (operation["recipient"] and operation["recipient"] not in self.wallets):
                 raise RuntimeError("pending operation needs an excluded wallet; restore wallet_count")
@@ -188,6 +189,54 @@ class Runner:
         # Run recovery with the same concurrency as a round. Sequential replay
         # of heavy consolidations stalls the chain for minutes after a restart.
         return all(await asyncio.gather(*(self.execute(operation) for operation in operations)))
+
+    def schedule_consolidations(self, balances, round_id):
+        """Queue merges for over-target wallets; they build while rounds mine."""
+        workers = self.config["consolidate_workers"]
+        if not workers or not round_id:
+            return
+        unfinished = [op for op in self.journal.unfinished() if op["background"]]
+        for operation in unfinished:
+            if operation["id"] not in self.background:
+                self.background[operation["id"]] = asyncio.create_task(
+                    self.run_background(operation))
+        busy_wallets = {operation["wallet"] for operation in unfinished}
+        free = workers - len(self.background)
+        if free <= 0:
+            return
+        over = []
+        for wallet in self.wallets:
+            if wallet == "treasury" or wallet in busy_wallets:
+                continue
+            count = available_note_count(balances[wallet])
+            if count > self.config["note_target"]:
+                over.append((count, wallet))
+        over.sort(reverse=True)
+        for count, wallet in over[:free]:
+            operation = self.journal.plan(
+                round_id, wallet, None,
+                ["consolidate", "--max-inputs", str(self.config["consolidate_max_inputs"])],
+                background=True)
+            self.background[operation["id"]] = asyncio.create_task(
+                self.run_background(operation))
+            emit("consolidation_queued", wallet=wallet, notes=count,
+                 operation_id=operation["id"])
+
+    async def run_background(self, operation):
+        try:
+            await self.execute(operation)
+            saved = self.journal.get(operation["id"])
+            emit("consolidation_done", wallet=operation["wallet"],
+                 operation_id=operation["id"], txid=saved["txid"], status=saved["status"])
+        except OssNotReady:
+            emit("consolidation_deferred", wallet=operation["wallet"],
+                 operation_id=operation["id"])
+        except Exception as error:
+            self.journal.update(operation["id"], status="failed")
+            emit("consolidation_error", wallet=operation["wallet"],
+                 operation_id=operation["id"], error=str(error)[:300])
+        finally:
+            self.background.pop(operation["id"], None)
 
     def matches_round(self, transactions, expected):
         actual = set(transactions)
@@ -271,9 +320,11 @@ class Runner:
             return False
         emit("round", round_id=round_id, mode=mode, height=height, target=target, bootstrap=bootstrap)
         if target:
+            tachyon_allowed = (feed["poolHeight"] + 1) % feed["epochLength"] != 0
+            if tachyon_allowed:
+                self.schedule_consolidations(balances, round_id)
             busy = {operation["wallet"] for operation in self.journal.unfinished()}
             utxos = await self.funding_utxos(busy, balances)
-            tachyon_allowed = (feed["poolHeight"] + 1) % feed["epochLength"] != 0
             payments = []
             faucet_payment = self.faucet.payment(balances, utxos, busy, tachyon_allowed)
             if faucet_payment:
@@ -284,25 +335,6 @@ class Runner:
             if funding and tachyon_allowed:
                 payments.append(funding)
                 busy.add("treasury")
-            if tachyon_allowed:
-                # Keep note counts bounded: replace send slots with merges for
-                # the wallets furthest above the target (dust is taken first).
-                over = []
-                for wallet in self.wallets:
-                    if wallet == "treasury" or wallet in busy:
-                        continue
-                    count = available_note_count(balances[wallet])
-                    if count > self.config["note_target"]:
-                        over.append((count, wallet))
-                over.sort(reverse=True)
-                emit("consolidation_scan", over=len(over), target=target,
-                     top=over[:3] or None)
-                for _, wallet in over[: min(self.config["consolidate_slots"], target)]:
-                    if len(payments) >= target:
-                        break
-                    payments.append(consolidation_payment(
-                        wallet, self.config["consolidate_max_inputs"]))
-                    busy.add(wallet)
             if not bootstrap:
                 shuffled = [wallet for wallet in self.wallets if wallet not in busy]
                 self.rng.shuffle(shuffled)

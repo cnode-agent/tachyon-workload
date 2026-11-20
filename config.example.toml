@@ -21,9 +21,10 @@ max_amount_zat = 2000000
 seed_amount_zat = 10000000
 seed_notes = 3
 # Consolidation: merge each wallet's smallest notes when it exceeds this count.
+# Merges run in the background so rounds keep their payment cadence.
 note_target = 256
-consolidate_max_inputs = 32
-consolidate_slots = 4
+consolidate_max_inputs = 16
+consolidate_workers = 2
 
 [weights]
 send = 80

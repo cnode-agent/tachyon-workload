@@ -49,8 +49,8 @@ def load_config(path):
                     timing=False,
                     min_amount_zat=100_000, max_amount_zat=2_000_000,
                     seed_amount_zat=10_000_000, seed_notes=3,
-                    note_target=256, consolidate_max_inputs=32,
-                    consolidate_slots=4,
+                    note_target=256, consolidate_max_inputs=16,
+                    consolidate_workers=2,
                     weights={"send": 80, "unshield": 8, "shield": 8,
                              "transparent-send": 4})
     allowed = {*defaults, "rpc_url", "oss_url", "devtool", "wallet_root", "state_dir", "cookie_file",
@@ -75,7 +75,7 @@ def load_config(path):
         ("wallet_count", 2, 128), ("max_transactions", 0, 128),
         ("concurrency", 1, 16), ("activation_height", 1, 2**32 - 1),
         ("note_target", 1, 1_000_000), ("consolidate_max_inputs", 2, 64),
-        ("consolidate_slots", 0, 16),
+        ("consolidate_workers", 0, 16),
         ("poll_seconds", 1, 60), ("command_timeout", 30, 7200),
         ("min_amount_zat", 1, 10**12), ("max_amount_zat", 1, 10**12),
         ("seed_amount_zat", 1, 10**12), ("seed_notes", 1, 16),
@@ -227,6 +227,12 @@ class Journal:
                 receipt_delivered INTEGER NOT NULL DEFAULT 0);
         """)
 
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(operations)")}
+        if "background" not in columns:
+            with self.db:
+                self.db.execute(
+                    "ALTER TABLE operations ADD COLUMN background INTEGER NOT NULL DEFAULT 0")
+
         if self.db.execute("SELECT 1 FROM rounds WHERE finished=0 AND mode IN ('prewarm','deferred')").fetchone():
             self.close()
             raise RuntimeError("journal has unfinished prewarm rounds; let the previous release "
@@ -264,12 +270,13 @@ class Journal:
             return None
         return cursor.lastrowid
 
-    def plan(self, round_id, wallet, recipient, args, *, faucet=None):
+    def plan(self, round_id, wallet, recipient, args, *, faucet=None, background=False):
         operation = "workload:" + uuid.uuid4().hex
         with self.db:
             self.db.execute(
-                "INSERT INTO operations(id,round_id,wallet,recipient,args,kind) VALUES (?,?,?,?,?,?)",
-                (operation, round_id, wallet, recipient, json.dumps(args), args[0]))
+                "INSERT INTO operations(id,round_id,wallet,recipient,args,kind,background) VALUES (?,?,?,?,?,?,?)",
+                (operation, round_id, wallet, recipient, json.dumps(args), args[0],
+                 1 if background else 0))
             if faucet is not None:
                 policy, amount, purpose = faucet
                 row = self.db.execute("SELECT address FROM faucet_policies WHERE id=?", (policy,)).fetchone()
@@ -311,7 +318,8 @@ class Journal:
         return [dict(row) for row in self.db.execute("SELECT * FROM rounds WHERE finished=0 ORDER BY id")]
 
     def round_operations(self, round_id):
-        return [dict(row) for row in self.db.execute("SELECT * FROM operations WHERE round_id=?", (round_id,))]
+        return [dict(row) for row in self.db.execute(
+            "SELECT * FROM operations WHERE round_id=? AND background=0", (round_id,))]
 
     def reconcile(self, wallet, transactions):
         # Revisit mined records too: devtool can change them back to pending after a reorg.
