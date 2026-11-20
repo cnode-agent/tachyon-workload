@@ -227,6 +227,15 @@ class Journal:
                 receipt_delivered INTEGER NOT NULL DEFAULT 0);
         """)
 
+        # The journal grows without bound; these keep per-round status and
+        # round lookups off a full scan (555k rows after a few weeks).
+        self.db.executescript("""
+            CREATE INDEX IF NOT EXISTS operations_status ON operations(status);
+            CREATE INDEX IF NOT EXISTS operations_round ON operations(round_id);
+            CREATE INDEX IF NOT EXISTS operations_receipt
+                ON operations(recipient, receipt_delivered);
+            CREATE INDEX IF NOT EXISTS rounds_finished ON rounds(finished);
+        """)
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(operations)")}
         if "background" not in columns:
             with self.db:
